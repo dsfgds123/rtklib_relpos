@@ -1,0 +1,124 @@
+function rtk=relativepos(rtk,obsr,obsu,nav,Mode,ARmode)
+
+global MINFIX SOLQ_NONE SOLQ_FLOAT SOLQ_FIX MAXSAT;
+
+stat=SOLQ_FLOAT;
+% --- MODIFIED START: Initialize ratio to ensure the field always exists ---
+rtk.sol.ratio = 0.0; % Default to 0 for float solutions
+% --- MODIFIED END ---
+
+% --- Data extraction from new structures ---
+time_r = obsr.time;
+tr_r = obsr.time_vec;
+data_r = obsr.data;
+Snum_r = size(data_r, 1);
+R_r = data_r(:, 2);
+Code_r = data_r(:, 1);
+Sys_r = data_r(:, 8);
+
+time_b = obsu.time;
+tr_b = obsu.time_vec;
+data_b = obsu.data;
+Snum_b = size(data_b, 1);
+R_b = data_b(:, 2);
+Code_b = data_b(:, 1);
+Sys_b = data_b(:, 8);
+
+dt = timediff(time_r, time_b);
+tJD_r = TimetoJD(tr_r(1), tr_r(2), tr_r(3), tr_r(4), tr_r(5), tr_r(6));
+
+[RS_r,DTS_r,VAR_r] = satposs(time_r, tJD_r, Code_r, Snum_r, nav, R_r, Sys_r);
+[RS_b,DTS_b,VAR_b] = satposs(time_r, tJD_r, Code_b, Snum_b, nav, R_b, Sys_b);
+
+[y_b,e_b,azel_b] = zdres(time_b, obsu, Snum_b, RS_b, DTS_b, rtk.rb);
+[ns,sat,ir,ib] = selsat(obsr, Snum_r, obsu, Snum_b, azel_b);
+rtk = udstate(Mode, ARmode, rtk, obsr, obsu, sat, ir, ib, ns, nav);
+
+xp=rtk.x;
+
+[y_r,e_r,azel_r] = zdres(time_r, obsr, Snum_r, RS_r, DTS_r, xp(1:3));
+
+for j=1:Snum_r
+    current_prn = data_r(j, 1);
+    for k=1:MAXSAT
+        if current_prn == k
+            rtk.ssat(k).azel=[azel_r(2*j-1), azel_r(2*j)];
+            break;
+        end
+    end
+end
+
+[nv,rtk,v,H,R,vflg]=ddres(rtk,dt,xp(1:3),sat,y_r,e_r,azel_r,y_b,ir,ib,ns,1);
+Pp=rtk.P;
+[xp_,Pp_]=EKF_filter(xp,Pp,H,v,R,rtk.nx,nv,0);
+
+if(stat~=SOLQ_NONE)
+    [y_r,e_r,azel_r]=zdres(time_r,obsr,Snum_r,RS_r,DTS_r,xp_(1:3));
+    [nv,rtk,v,H,R,vflg]=ddres(rtk,dt,xp_(1:3),sat,y_r,e_r,azel_r,y_b,ir,ib,ns,0);
+    
+    if(valpos(rtk,v,R,vflg,nv,4))
+        rtk.x=xp_;
+        rtk.P=Pp_;
+        rtk.sol.ns=0;
+        for i=1:ns
+            if ~rtk.ssat(sat(i)).vsat
+                continue;
+            end
+            rtk.ssat(sat(i)).lock=rtk.ssat(sat(i)).lock+1;
+            rtk.ssat(sat(i)).outc=0;
+            rtk.sol.ns=rtk.sol.ns+1;
+        end
+        if rtk.sol.ns<4
+            stat=SOLQ_NONE;
+        end
+    else
+        stat=SOLQ_NONE;
+    end
+end
+
+if stat~=SOLQ_NONE
+    [rtk,xa,AmbNum]=resamb_AGGWO(rtk); % This function calculates the ratio and likely stores it in rtk.sol.ratio
+    if AmbNum>1
+        [y_r,e_r,azel_r]=zdres(time_r,obsr,Snum_r,RS_r,DTS_r,xa(1:3));
+        [nv,rtk,v,H,R,vflg]=ddres(rtk,dt,xa(1:3),sat,y_r,e_r,azel_r,y_b,ir,ib,ns,0);
+        
+        if(valpos(rtk,v,R,vflg,nv,4))
+            rtk.nfix=rtk.nfix+1;
+            if(rtk.nfix>=MINFIX&ARmode==2)
+                [SsatFix,rtk.x,rtk.P]=holdamb(rtk,xa);
+                for i=1:MAXSAT
+                    rtk.ssat(i).fix=SsatFix(i);
+                end
+            end
+            stat=SOLQ_FIX;
+        end
+    end
+end
+
+% --- MODIFIED START: Preserve the ratio value during final result packaging ---
+% The ratio is calculated in resamb_AGGWO and stored in rtk.sol.ratio.
+% We must save it to a temporary variable before updating the rest of sol.
+temp_ratio = rtk.sol.ratio;
+
+if stat==SOLQ_FIX
+    rtk.sol.rr=[rtk.xa(1), rtk.xa(2), rtk.xa(3)];
+    rtk.sol.qr=[rtk.Pa(1,1), rtk.Pa(2,2), rtk.Pa(3,3)];
+else
+    rtk.sol.rr=[rtk.x(1), rtk.x(2), rtk.x(3)];
+    rtk.sol.qr=[rtk.P(1,1), rtk.P(2,2), rtk.P(3,3)];
+    rtk.nfix=0;
+end
+
+% Now, restore the ratio value to the final output structure
+rtk.sol.ratio = temp_ratio;
+% Also, ensure solution status is correctly set in the output
+rtk.sol.stat = stat;
+% --- MODIFIED END ---
+
+for i=1:MAXSAT
+    if rtk.ssat(i).fix==2&stat~=SOLQ_FIX
+        rtk.ssat(i).fix=1;
+    end
+end
+
+end

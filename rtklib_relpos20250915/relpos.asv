@@ -1,0 +1,108 @@
+% function relpos
+% ... (version history) ...
+% --- FINAL VERSION with correct state propagation logic ---
+
+close all;clear ;clc;
+tic
+
+% --- Global Constants ---
+global CLIGHT SOLQ_NONE SOLQ_SINGLE SOLQ_FLOAT SOLQ_FIX MINFIX MAXSAT;
+global FREQ1 FREQ2 D2R R2D RE_WGS84 FE_WGS84 OMGE;
+CLIGHT=299792458; SOLQ_NONE=0; SOLQ_SINGLE=1; SOLQ_FLOAT=2; SOLQ_FIX=3;
+MINFIX=10; MAXSAT=60; FREQ1=1.57542E+9; FREQ2=1.22760E+9; D2R=pi/180.0;
+R2D=180.0/pi; RE_WGS84=6378137.0; FE_WGS84=(1.0/298.257223563); OMGE=7.2921151467E-5;
+
+% --- Data Loading ---
+fprintf('Reading RINEX 3.02 Navigation file...\n');
+nav = readrinexnav3('C:\Users\tjc\Desktop\读取gps加北斗改进经历\rtklib_relpos20250915\1h数据\base.nav');
+fprintf('Reading RINEX 3.02 Rover OBS file...\n');
+ObsODat_rover = readrinexobs3('C:\Users\tjc\Desktop\读取gps加北斗改进经历\rtklib_relpos20250915\1h数据\rover.obs');
+fprintf('Reading RINEX 3.02 Base OBS file...\n');
+ObsODat_base = readrinexobs3('C:\Users\tjc\Desktop\读取gps加北斗改进经历\rtklib_relpos20250915\1h数据\base.obs');
+
+% --- MODIFIED START: Transform true coordinates to ECEF ---
+% Your original Xk0 seems to be in ECEF, let's keep it that way.
+Xk0_ecef = [-2005033.7825+2.1130; 5411163.2342+0.0233; 2707856.6419+0.0242];
+% We need the origin for ENU conversion
+pos_origin = ecef2pos(Xk0_ecef');
+% --- MODIFIED END ---
+
+% --- RTK Initialization ---
+rtk=rtkinit;
+ARmode=2; Mode=0;
+rtk.rb=[-2005033.7825, 5411163.2342, 2707856.6419];
+
+% --- Main Processing Loop ---
+epoch_num_r = length(ObsODat_rover);
+epoch_num_b = length(ObsODat_base);
+num_epochs_to_process = min(epoch_num_r, epoch_num_b);
+% Pre-allocate result arrays
+sol = repmat(rtk.sol, num_epochs_to_process, 1);
+enu_error = zeros(num_epochs_to_process, 3);
+ratio     = zeros(num_epochs_to_process, 1);
+sol_stat  = zeros(num_epochs_to_process, 1);
+
+kr = 1; kb = 1; k_out = 0;
+fprintf('Starting epoch-by-epoch processing...\n');
+while kr <= epoch_num_r && kb <= epoch_num_b
+    time_r = ObsODat_rover(kr).time;
+    time_b = ObsODat_base(kb).time;
+    if abs(time_r - time_b) < 0.01
+        k_out = k_out + 1;
+        
+        % --- MODIFIED START: Correct Data Flow ---
+        % 1. Calculate a standalone SPP solution. This is ONLY for initialization.
+        sol_spp = pointpos(ObsODat_rover(kr), nav);
+        
+        % 2. Update the time difference.
+        if k_out > 1, rtk.tt = timediff(sol_spp.time, sol(k_out-1).time); end
+        
+        % 3. Call the main relative positioning engine.
+        %    It will use the previous epoch's filtered state.
+        %    It will ONLY use sol_spp if its own state is zero.
+        rtk = relativepos(rtk, ObsODat_rover(kr), ObsODat_base(kb), nav, Mode, ARmode, sol_spp);
+        % --- MODIFIED END ---
+        
+        % Store results for this matched epoch
+        sol(k_out) = rtk.sol;
+        
+        % --- MODIFIED: Calculate error in ENU frame for meaningful plotting ---
+        ecef_error = rtk.sol.rr' - Xk0_ecef;
+        enu_error(k_out, :) = ecef2enu(pos_origin, ecef_error');
+        
+        ratio(k_out) = rtk.sol.ratio;
+        sol_stat(k_out) = rtk.sol.stat;
+        
+        kr = kr + 1; kb = kb + 1;
+    elseif time_r < time_b, kr = kr + 1;
+    else, kb = kb + 1; end
+end
+fprintf('Processing finished. Total matched epochs: %d\n', k_out);
+
+% --- Trim result arrays ---
+if k_out > 0
+    enu_error = enu_error(1:k_out, :);
+    ratio = ratio(1:k_out);
+    sol_stat = sol_stat(1:k_out);
+end
+
+% --- Plotting section (Upgraded for better analysis) ---
+figure(1);
+plot(enu_error(:,1),'b.-'); hold on;
+plot(enu_error(:,2),'r.-');
+plot(enu_arror(:,3),'k.-');
+legend('East (m)','North (m)','Up (m)');
+title('Position Error (E-N-U)');
+xlabel('Epoch'); ylabel('Error (m)');
+grid on;
+
+figure(2);
+plot(ratio, 'g.-'); hold on;
+plot(sol_stat, 'm*');
+legend('Ratio', 'Solution Status (1:SPP, 2:Float, 3:Fix)');
+title('Ratio and Solution Status');
+xlabel('Epoch'); ylabel('Ratio Value');
+ylim([0, max(max(ratio), 5)]); % Adjust y-axis for better view
+grid on;
+
+toc
